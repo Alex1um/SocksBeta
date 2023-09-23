@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream, SocketAddr, IpAddr, Ipv4Addr};
 use std::io::{Read, Write, self};
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 use anyhow::{Result, Error};
 use request_errors::CommandNotAllowedError;
+use polling::{Event, Poller, Events};
+
 
 #[repr(u8)]
 enum SOCKSReply {
@@ -186,7 +189,6 @@ fn serve(target_stream: &mut TcpStream, client_stream: &mut TcpStream) -> Result
 
 
 fn serve_epoll(target_stream: &mut TcpStream, client_stream: &mut TcpStream) -> Result<()> {
-    use polling::{Event, Poller, Events};
 
     let mut client_buffer = [0; 4096];
     let mut target_buffer = [0; 4096];
@@ -217,6 +219,8 @@ fn serve_epoll(target_stream: &mut TcpStream, client_stream: &mut TcpStream) -> 
                     Ok(n) => {
                         target_stream.write_all(&client_buffer[..n])?;
                         target_stream.flush()?;
+                        poller.modify(client_stream as &TcpStream, Event::readable(1))?;
+                        poller.modify(target_stream as &TcpStream, Event::readable(2))?;
                     }
                     Err(e) => {
                         client_closed = true;
@@ -229,6 +233,8 @@ fn serve_epoll(target_stream: &mut TcpStream, client_stream: &mut TcpStream) -> 
                     Ok(n) => {
                         client_stream.write_all(&target_buffer[..n])?;
                         client_stream.flush()?;
+                        poller.modify(target_stream as &TcpStream, Event::readable(2))?;
+                        poller.modify(client_stream as &TcpStream, Event::readable(1))?;
                     }
                     Err(e) => {
                         target_closed = true;
@@ -237,8 +243,6 @@ fn serve_epoll(target_stream: &mut TcpStream, client_stream: &mut TcpStream) -> 
                 _ => {}
             }
         }
-        poller.modify(client_stream as &TcpStream, Event::readable(1))?;
-        poller.modify(target_stream as &TcpStream, Event::readable(2))?;
         if client_closed || target_closed {
             break;
         }
@@ -247,16 +251,28 @@ fn serve_epoll(target_stream: &mut TcpStream, client_stream: &mut TcpStream) -> 
 }
 
 
-fn handle_client(mut client_stream: TcpStream) {
-
+fn handle_client(mut client_stream: TcpStream, cons: &mut HashMap<usize, Connection>, current_key: &mut usize, poller: &Poller) {
     if let Ok(version) = process_method(&mut client_stream) {
         println!("version: {}", version);
         if let Ok(target_addr) = process_request(&mut client_stream) {
             if let Ok(mut target_stream) = TcpStream::connect(&target_addr) {
                 println!("target stream: {:?}", target_stream);
                 if let Ok(_) = reply(&mut client_stream, version, SOCKSReply::Succeeded, &target_addr) {
-                    let _ = serve_epoll(&mut target_stream, &mut client_stream);
-                    println!("done to {:?}", target_stream);
+                    // let _ = serve_epoll(&mut target_stream, &mut client_stream);
+                    // println!("done to {:?}", target_stream);
+                    client_stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                    target_stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                    // client_stream.set_nonblocking(true).unwrap();
+                    // target_stream.set_nonblocking(true).unwrap();
+                    unsafe {
+                        poller.add(&client_stream, Event::readable(*current_key)).unwrap();
+                        poller.add(&target_stream, Event::readable(*current_key + 1)).unwrap();
+                    }
+                    cons.insert(*current_key, Connection { con: client_stream, other_key: *current_key + 1 });
+                    cons.insert(*current_key + 1, Connection { con: target_stream, other_key: *current_key });
+                    *current_key += 2;
+                    println!("inserted all");
+                    return;
                 }
                 
                 let _ = target_stream.shutdown(std::net::Shutdown::Both);
@@ -276,6 +292,20 @@ fn handle_client(mut client_stream: TcpStream) {
 }
     
 
+struct Connection {
+    con: TcpStream,
+    other_key: usize,
+}
+
+impl Connection {
+    fn write_into(&mut self, buf: &[u8]) -> Result<()> {
+        self.con.write_all(buf)?;
+        self.con.flush()?;
+        Ok(())
+    }
+}
+
+
 fn main() {
     // Получаем порт из параметров программы
     let port: u16 = std::env::args()
@@ -288,14 +318,72 @@ fn main() {
         .parse()
         .expect("Invalid port number");
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
-    for stream in listener.incoming() {
-        match stream {
-            Ok(client_stream) => {
-                println!("new con! {:?}", client_stream);
-                handle_client(client_stream);
 
+    let poller = Poller::new().expect("poller creation");
+    unsafe {
+        poller.add(&listener, Event::readable(1)).expect("added listener to poller");
+    }
+    let mut events = Events::new();
+
+    let mut cons = HashMap::<usize, Connection>::new();
+
+    let mut current_key = 2usize;
+
+    loop {
+        let mut buffer = [0; 4096];
+
+        events.clear();
+        poller.wait(&mut events, None).unwrap();
+        for event in events.iter() {
+            match event.key {
+                1 => {
+                    for stream in listener.incoming() {
+                        if let Ok(client_stream) = stream {
+                            println!("new con! {:?}", client_stream);
+                            handle_client(client_stream, &mut cons, &mut current_key, &poller);
+                            break;
+                        }
+                    }
+                    poller.modify(&listener, Event::readable(1)).unwrap();
+                }
+                key => {
+                    if cons.contains_key(&key) {
+                        let (target_key, read_r) = {
+                            let con = cons.get_mut(&key).unwrap();
+                            poller.modify(&con.con, Event::readable(key)).unwrap();
+                            (con.other_key, con.con.read(&mut buffer))
+                        };
+                        match read_r {
+                            Ok(0) | Err(_) => {
+                                {
+                                    let con = cons.get_mut(&key).unwrap();
+                                    poller.delete(&con.con).unwrap();
+                                    cons.remove(&key);
+                                }
+                                {
+                                    let con = cons.get_mut(&target_key).unwrap();
+                                    poller.delete(&con.con).unwrap();
+                                    cons.remove(&target_key);
+                                }
+                            }
+                            Ok(n) => {
+                                if let Err(_) = cons.get_mut(&target_key).unwrap().write_into(&buffer[..n]) {
+                                    {
+                                        let con = cons.get_mut(&key).unwrap();
+                                        poller.delete(&con.con).unwrap();
+                                        cons.remove(&key);
+                                    }
+                                    {
+                                        let con = cons.get_mut(&target_key).unwrap();
+                                        poller.delete(&con.con).unwrap();
+                                        cons.remove(&target_key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            Err(_) => {}
         }
     }
 }
